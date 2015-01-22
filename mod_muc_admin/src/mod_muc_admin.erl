@@ -25,6 +25,7 @@
 	 set_room_affiliation/4,
 	 get_room_affiliations/2,
          send_system_message/3,
+         send_message_chat/4,
 	 web_menu_main/2, web_page_main/2, % Web Admin API
 	 web_menu_host/3, web_page_host/3
 	]).
@@ -141,14 +142,14 @@ commands() ->
 		       desc = "Change an option in a MUC room",
 		       module = ?MODULE, function = change_room_option,
 		       args = [{name, binary}, {service, binary},
-			       {option, string}, {value, string}],
+			       {option, binary}, {value, binary}],
 		       result = {res, rescode}},
 
      #ejabberd_commands{name = set_room_affiliation, tags = [muc_room],
 		       desc = "Change an affiliation in a MUC room",
 		       module = ?MODULE, function = set_room_affiliation,
 		       args = [{name, binary}, {service, binary},
-			       {jid, binary}, {affiliation, string}],
+			       {jid, binary}, {affiliation, binary}],
 		       result = {res, rescode}},
      #ejabberd_commands{name = get_room_affiliations, tags = [muc_room],
 			desc = "Get the list of affiliations of a MUC room",
@@ -166,7 +167,39 @@ commands() ->
 			desc = "Send a system message to a room",
 			module = ?MODULE, function = send_system_message,
 			args = [{name, binary}, {service, binary}, {message, binary}],
-			result = {res, rescode}}
+			result = {res, rescode}},
+
+     #ejabberd_commands{name = send_message_chat, tags = [muc_room],
+      desc = "Send a chat message to a local or remote bare of full JID",
+      module = ?MODULE, function = send_message_chat,
+      args = [
+        {from, binary}, 
+        {to, binary}, 
+        {body, binary}, 
+        {markup, {list, 
+          {tvam, {tuple, 
+  	     [{tag, binary},
+              {value, binary},
+	      {attributes, {list,
+		{attribute, {tuple,
+		  [{name, binary},
+		   {value, binary}
+		  ]}}}},
+              {markup, {list, 
+          	{tva, {tuple, 
+                   [{tag, binary},
+                    {value, binary},
+		    {attributes, {list,
+		     {attribute, {tuple,
+		       [{name, binary},
+		        {value, binary}]}}}}
+		   ]}
+                }}}
+            ]} 
+           }} 
+        }
+      ],
+      result = {res, rescode}}
     ].
 
 
@@ -756,7 +789,7 @@ change_room_option(Name, Service, OptionString, ValueString) ->
 	title -> ValueString;
 	description -> ValueString;
 	password -> ValueString;
-	max_users -> list_to_integer(ValueString);
+	max_users -> list_to_integer(binary_to_list(ValueString));
 	_ -> list_to_atom(binary_to_list(ValueString))
     end,
     change_room_option(Name, Service, Option, Value).
@@ -883,6 +916,7 @@ make_opts(StateData) ->
      {subject, StateData#state.subject},
      {subject_author, StateData#state.subject_author}
     ].
+
 %%----------------------------
 %% Send messages
 %%----------------------------
@@ -892,6 +926,69 @@ send_system_message(Name, Service, Msg) ->
 	Pid -> gen_fsm:send_all_state_event(Pid, {service_message, Msg})
     end.
        
+%% @doc Send a chat message to a Jabber account.
+%% @spec (From::binary(), To::binary(), Body::binary(), Metadata::list()) -> ok
+send_message_chat(From, To, Body, Markup) ->
+    Packet = build_packet(message_chat, [Body, Markup]),
+    send_packet_all_resources(From, To, Packet).
+
+
+%% @doc Send a packet to a Jabber account.
+%% If a resource was specified in the JID,
+%% the packet is sent only to that specific resource.
+%% If no resource was specified in the JID,
+%% and the user is remote or local but offline,
+%% the packet is sent to the bare JID.
+%% If the user is local and is online in several resources,
+%% the packet is sent to all its resources.
+send_packet_all_resources(FromJIDString, ToJIDString, Packet) ->
+    FromJID = jlib:string_to_jid(FromJIDString),
+    ToJID = jlib:string_to_jid(ToJIDString),
+    ToUser = ToJID#jid.user,
+    ToServer = ToJID#jid.server,
+    case ToJID#jid.resource of
+  <<>> ->
+      send_packet_all_resources(FromJID, ToUser, ToServer, Packet);
+  Res ->
+      send_packet_all_resources(FromJID, ToUser, ToServer, Res, Packet)
+    end.
+
+send_packet_all_resources(FromJID, ToUser, ToServer, Packet) ->
+    case ejabberd_sm:get_user_resources(ToUser, ToServer) of
+  [] ->
+      send_packet_all_resources(FromJID, ToUser, ToServer, <<>>, Packet);
+  ToResources ->
+      lists:foreach(
+        fun(ToResource) ->
+          send_packet_all_resources(FromJID, ToUser, ToServer,
+            ToResource, Packet)
+        end,
+        ToResources)
+    end.
+
+send_packet_all_resources(FromJID, ToU, ToS, ToR, Packet) ->
+    ToJID = jlib:make_jid(ToU, ToS, ToR),
+    ejabberd_router:route(FromJID, ToJID, Packet).
+
+build_packet(message_chat, [Body, Markup]) ->
+    {xmlel, <<"message">>,
+     [{<<"type">>, <<"groupchat">>}, {<<"id">>, randoms:get_string()}],
+     [{xmlel, <<"body">>, [], [{xmlcdata, Body}]}] ++ build_metadata_tags(Markup)
+    }.
+
+build_metadata_tags(Metadata) ->
+    lists:map(fun build_metadata_tag/1, Metadata).
+
+build_metadata_tag({Tag, Value, Attributes, []}) ->
+    {xmlel, Tag, Attributes, [{xmlcdata, Value}]};
+build_metadata_tag({Tag, _, Attributes, Children}) ->
+    {xmlel, Tag, Attributes, build_metadata_children(Children)}.
+
+build_metadata_children([]) -> [];
+build_metadata_children([Head|Tail]) ->
+    {Tag, Value, Attributes} = Head,
+    [{xmlel, Tag, Attributes, [{xmlcdata, Value}]}] ++ build_metadata_children(Tail).
+
 %%----------------------------
 %% Utils
 %%----------------------------
